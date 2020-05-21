@@ -29,6 +29,21 @@ use ash::extensions::{
 
 #[cfg(target_os = "windows")]
 use ash::extensions::khr::Win32Surface;
+use winit::event::{
+    ElementState,
+    Event,
+    KeyboardInput,
+    StartCause,
+    VirtualKeyCode,
+    WindowEvent,
+};
+use winit::event_loop::{ControlFlow, EventLoop};
+use winit::window::{Window, WindowBuilder};
+use std::os::raw::c_void;
+use std::{thread, time};
+
+
+
 #[cfg(target_os = "macos")]
 use ash::extensions::mvk::MacOSSurface;
 pub use ash::version::{DeviceV1_0, EntryV1_0, InstanceV1_0};
@@ -105,7 +120,7 @@ pub fn record_submit_commandbuffer<D: DeviceV1_0, F: FnOnce(&D, vk::CommandBuffe
 unsafe fn create_surface<E: EntryV1_0, I: InstanceV1_0>(
     entry: &E,
     instance: &I,
-    window: &winit::Window,
+    window: &Window,
 ) -> Result<vk::SurfaceKHR, vk::Result> {
     use winit::os::unix::WindowExt;
     let x11_display = window.get_xlib_display().unwrap();
@@ -122,7 +137,7 @@ unsafe fn create_surface<E: EntryV1_0, I: InstanceV1_0>(
 unsafe fn create_surface<E: EntryV1_0, I: InstanceV1_0>(
     entry: &E,
     instance: &I,
-    window: &winit::Window,
+    window: &Window,
 ) -> Result<vk::SurfaceKHR, vk::Result> {
     use std::ptr;
     use winit::os::macos::WindowExt;
@@ -156,14 +171,13 @@ unsafe fn create_surface<E: EntryV1_0, I: InstanceV1_0>(
 unsafe fn create_surface<E: EntryV1_0, I: InstanceV1_0>(
     entry: &E,
     instance: &I,
-    window: &winit::Window,
+    window: &winit::window::Window,
 ) -> Result<vk::SurfaceKHR, vk::Result> {
     use std::ptr;
     use winapi::shared::windef::HWND;
     use winapi::um::libloaderapi::GetModuleHandleW;
-    use winit::os::windows::WindowExt;
-
-    let hwnd = window.get_hwnd() as HWND;
+    use winit::platform::windows::WindowExtWindows;
+    let hwnd = window.hwnd() as HWND;
     let hinstance = GetModuleHandleW(ptr::null()) as *const c_void;
     let win32_create_info = vk::Win32SurfaceCreateInfoKHR {
         s_type: vk::StructureType::WIN32_SURFACE_CREATE_INFO_KHR,
@@ -278,8 +292,8 @@ pub struct ExampleBase {
     pub surface_loader: Surface,
     pub swapchain_loader: Swapchain,
     pub debug_utils_loader: DebugUtils,
-    pub window: winit::Window,
-    pub events_loop: RefCell<winit::EventsLoop>,
+    pub window: Window,
+    pub event_loop: RefCell<EventLoop<()>>,
     pub debug_call_back: vk::DebugUtilsMessengerEXT,
 
     pub pdevice: vk::PhysicalDevice,
@@ -307,38 +321,108 @@ pub struct ExampleBase {
     pub rendering_complete_semaphore: vk::Semaphore,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Wait,
+    WaitUntil,
+    Poll,
+}
+
 impl ExampleBase {
     pub fn render_loop<F: Fn()>(&self, f: F) {
-        use winit::*;
-        self.events_loop.borrow_mut().run_forever(|event| {
+        // use winit::*;
+        const WAIT_TIME: time::Duration = time::Duration::from_millis(100);
+        const POLL_SLEEP_TIME: time::Duration = time::Duration::from_millis(100);
+        let mut mode = Mode::Wait;
+        let mut request_redraw = false;
+        let mut wait_cancelled = false;
+        let mut close_requested = false;
+        self.event_loop.borrow_mut().run(|event, _, control_flow| {
             f();
             match event {
-                Event::WindowEvent { event, .. } => match event {
-                    WindowEvent::KeyboardInput { input, .. } => {
-                        if let Some(VirtualKeyCode::Escape) = input.virtual_keycode {
-                            ControlFlow::Break
-                        } else {
-                            ControlFlow::Continue
-                        }
+                Event::NewEvents(start_cause) => {
+                    wait_cancelled = match start_cause {
+                        StartCause::WaitCancelled { .. } => mode == Mode::WaitUntil,
+                        _ => false,
                     }
-                    WindowEvent::CloseRequested => winit::ControlFlow::Break,
-                    _ => ControlFlow::Continue,
+                }
+                Event::WindowEvent { event, .. } => match event {
+                    WindowEvent::CloseRequested => {
+                        close_requested = true;
+                    }
+                    WindowEvent::KeyboardInput {
+                        input:
+                            KeyboardInput {
+                                virtual_keycode: Some(virtual_code),
+                                state: ElementState::Pressed,
+                                ..
+                            },
+                        ..
+                    } => match virtual_code {
+                        VirtualKeyCode::Key1 => {
+                            mode = Mode::Wait;
+                            println!("\nmode: {:?}\n", mode);
+                        }
+                        VirtualKeyCode::Key2 => {
+                            mode = Mode::WaitUntil;
+                            println!("\nmode: {:?}\n", mode);
+                        }
+                        VirtualKeyCode::Key3 => {
+                            mode = Mode::Poll;
+                            println!("\nmode: {:?}\n", mode);
+                        }
+                        VirtualKeyCode::R => {
+                            request_redraw = !request_redraw;
+                            println!("\nrequest_redraw: {}\n", request_redraw);
+                        }
+                        VirtualKeyCode::Escape => {
+                            close_requested = true;
+                        }
+                        _ => (),
+                    },
+                    _ => (),
                 },
-                _ => ControlFlow::Continue,
+                Event::MainEventsCleared => {
+                    if request_redraw && !wait_cancelled && !close_requested {
+                        self.window.request_redraw();
+                    }
+                    if close_requested {
+                        *control_flow = ControlFlow::Exit;
+                    }
+                }
+                Event::RedrawRequested(_window_id) => {}
+                Event::RedrawEventsCleared => {
+                    *control_flow = match mode {
+                        Mode::Wait => ControlFlow::Wait,
+                        Mode::WaitUntil => {
+                            if wait_cancelled {
+                                *control_flow
+                            } else {
+                                ControlFlow::WaitUntil(time::Instant::now() + WAIT_TIME)
+                            }
+                        }
+                        Mode::Poll => {
+                            thread::sleep(POLL_SLEEP_TIME);
+                            ControlFlow::Poll
+                        }
+                    };
+                }
+                _ => (),
             }
         });
     }
 
     pub fn new(window_width: u32, window_height: u32) -> Self {
         unsafe {
-            let events_loop = winit::EventsLoop::new();
-            let window = winit::WindowBuilder::new()
+            // TODO rename this to event_loop
+            let event_loop = EventLoop::new();
+            let window = WindowBuilder::new()
                 .with_title("Ash - Example")
-                .with_dimensions(winit::dpi::LogicalSize::new(
+                .with_inner_size(winit::dpi::LogicalSize::new(
                     f64::from(window_width),
                     f64::from(window_height),
                 ))
-                .build(&events_loop)
+                .build(&event_loop)
                 .unwrap();
             let entry = Entry::new().unwrap();
             let app_name = CString::new("VulkanTriangle").unwrap();
@@ -642,7 +726,7 @@ impl ExampleBase {
                 .create_semaphore(&semaphore_create_info, None)
                 .unwrap();
             ExampleBase {
-                events_loop: RefCell::new(events_loop),
+                event_loop: RefCell::new(event_loop),
                 entry,
                 instance,
                 device,
